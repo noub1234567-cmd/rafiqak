@@ -19,8 +19,16 @@ import java.time.ZoneId
 
 object Scheduler {
     const val ACTION_SNOOZE_ALARM = "app.rafiqak.dhikr.SNOOZE_ALARM"
+    const val ACTION_CHECK = "app.rafiqak.dhikr.CHECK"
 
-    private fun matches(r: Reminder, d: LocalDate): Boolean =
+    // بعد كم دقيقة من الموعد نُرسل إشعار «لم تُنجز بعد» إن لم يؤكد المستخدم
+    const val CHECK_DELAY_MIN = 60
+
+    private const val KIND_MAIN = 1
+    private const val KIND_SNOOZE = 2
+    private const val KIND_CHECK = 6
+
+    fun matches(r: Reminder, d: LocalDate): Boolean =
         r.repeatType == "DAILY" || ((r.daysMask shr (d.dayOfWeek.value % 7)) and 1) == 1
 
     fun nextTime(r: Reminder, after: Long = System.currentTimeMillis()): Long? {
@@ -40,11 +48,25 @@ object Scheduler {
         return null
     }
 
-    private fun pending(c: Context, id: Long, snooze: Boolean): PendingIntent {
-        val i = Intent(c, AlarmReceiver::class.java).putExtra("id", id)
-        if (snooze) i.action = ACTION_SNOOZE_ALARM
-        val code = id.toInt() * 10 + (if (snooze) 2 else 1)
-        return PendingIntent.getBroadcast(c, code, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+    /** أقرب لحظة بهذه الساعة والدقيقة (اليوم إن لم تفت، وإلا غداً). */
+    fun nextClock(hour: Int, minute: Int, now: Long = System.currentTimeMillis()): Long {
+        val zone = ZoneId.systemDefault()
+        val today = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
+        val t = today.atTime(hour, minute).atZone(zone).toInstant().toEpochMilli()
+        return if (t > now) t
+        else today.plusDays(1).atTime(hour, minute).atZone(zone).toInstant().toEpochMilli()
+    }
+
+    private fun pending(c: Context, id: Long, kind: Int, day: Long = -1L): PendingIntent {
+        val i = Intent(c, AlarmReceiver::class.java).putExtra("id", id).putExtra("day", day)
+        when (kind) {
+            KIND_SNOOZE -> i.action = ACTION_SNOOZE_ALARM
+            KIND_CHECK -> i.action = ACTION_CHECK
+        }
+        return PendingIntent.getBroadcast(
+            c, id.toInt() * 10 + kind, i,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
     }
 
     private fun setAlarm(c: Context, at: Long, pi: PendingIntent) {
@@ -59,17 +81,30 @@ object Scheduler {
     fun schedule(c: Context, r: Reminder) {
         cancel(c, r.id)
         if (!r.enabled) return
-        nextTime(r)?.let { setAlarm(c, it, pending(c, r.id, false)) }
+        nextTime(r)?.let { setAlarm(c, it, pending(c, r.id, KIND_MAIN)) }
     }
 
     fun cancel(c: Context, id: Long) {
         val am = c.getSystemService(AlarmManager::class.java)
-        am.cancel(pending(c, id, false))
-        am.cancel(pending(c, id, true))
+        am.cancel(pending(c, id, KIND_MAIN))
+        am.cancel(pending(c, id, KIND_SNOOZE))
     }
 
-    fun snooze(c: Context, id: Long, minutes: Int) {
-        setAlarm(c, System.currentTimeMillis() + minutes * 60_000L, pending(c, id, true))
+    fun cancelAll(c: Context, id: Long) {
+        cancel(c, id)
+        c.getSystemService(AlarmManager::class.java).cancel(pending(c, id, KIND_CHECK))
+    }
+
+    fun snoozeAt(c: Context, id: Long, at: Long, day: Long = -1L) {
+        setAlarm(c, at, pending(c, id, KIND_SNOOZE, day))
+    }
+
+    fun snooze(c: Context, id: Long, minutes: Int, day: Long = -1L) {
+        snoozeAt(c, id, System.currentTimeMillis() + minutes * 60_000L, day)
+    }
+
+    fun scheduleCheck(c: Context, id: Long, day: Long) {
+        setAlarm(c, System.currentTimeMillis() + CHECK_DELAY_MIN * 60_000L, pending(c, id, KIND_CHECK, day))
     }
 
     suspend fun rescheduleAll(c: Context) {
@@ -91,19 +126,21 @@ object Notifier {
         )
     }
 
-    fun show(c: Context, r: Reminder) {
+    fun show(c: Context, r: Reminder, day: Long, late: Boolean) {
         ensureChannels(c)
         val nm = c.getSystemService(NotificationManager::class.java)
         val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         fun act(action: String, code: Int): PendingIntent = PendingIntent.getBroadcast(
             c, r.id.toInt() * 10 + code,
-            Intent(c, ActionReceiver::class.java).setAction(action).putExtra("id", r.id), flags
+            Intent(c, ActionReceiver::class.java).setAction(action).putExtra("id", r.id).putExtra("day", day),
+            flags
         )
         val open = PendingIntent.getActivity(c, r.id.toInt() * 10 + 5, Intent(c, MainActivity::class.java), flags)
+        val text = if (late) "لم تُنجز بعد" else r.note.ifBlank { r.category }
         val n = Notification.Builder(c, if (r.sound) CH_SOUND else CH_QUIET)
             .setSmallIcon(android.R.drawable.ic_popup_reminder)
             .setContentTitle(r.title)
-            .setContentText(r.note.ifBlank { r.category })
+            .setContentText(text)
             .setContentIntent(open)
             .setAutoCancel(true)
             .addAction(0, "تم", act(ActionReceiver.ACTION_DONE, 3))
@@ -117,14 +154,25 @@ class AlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val id = intent.getLongExtra("id", -1L)
         if (id < 0) return
+        val extraDay = intent.getLongExtra("day", -1L)
+        val isCheck = intent.action == Scheduler.ACTION_CHECK
         val app = context.applicationContext
         val pr = goAsync()
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val r = AppDb.get(app).dao().reminder(id)
+                val dao = AppDb.get(app).dao()
+                val r = dao.reminder(id)
                 if (r != null && r.enabled) {
-                    Notifier.show(app, r)
-                    Scheduler.schedule(app, r)
+                    val today = LocalDate.now().toEpochDay()
+                    val day = if (extraDay >= 0) extraDay else today
+                    if (isCheck) {
+                        // لا نعتبرها منجزة: إن لم يؤكد المستخدم نذكّره مرة واحدة أنها لم تُنجز بعد
+                        if (dao.doneCount(id, day) == 0) Notifier.show(app, r, day, true)
+                    } else {
+                        Notifier.show(app, r, day, false)
+                        Scheduler.schedule(app, r)
+                        if (day == today) Scheduler.scheduleCheck(app, id, day)
+                    }
                 }
             } finally {
                 pr.finish()
@@ -142,16 +190,18 @@ class ActionReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val id = intent.getLongExtra("id", -1L)
         if (id < 0) return
+        val extraDay = intent.getLongExtra("day", -1L)
         val app = context.applicationContext
         val action = intent.action
         val pr = goAsync()
         CoroutineScope(Dispatchers.IO).launch {
             try {
+                val day = if (extraDay >= 0) extraDay else LocalDate.now().toEpochDay()
                 app.getSystemService(NotificationManager::class.java).cancel(id.toInt())
                 when (action) {
                     ACTION_DONE -> AppDb.get(app).dao()
-                        .complete(Completion(id, LocalDate.now().toEpochDay(), System.currentTimeMillis()))
-                    ACTION_SNOOZE -> Scheduler.snooze(app, id, 10)
+                        .complete(Completion(id, day, System.currentTimeMillis()))
+                    ACTION_SNOOZE -> Scheduler.snooze(app, id, 10, day)
                 }
             } finally {
                 pr.finish()

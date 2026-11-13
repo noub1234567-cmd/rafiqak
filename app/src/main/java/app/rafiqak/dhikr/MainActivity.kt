@@ -75,7 +75,10 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -94,13 +97,37 @@ class MainVm(private val app: Application) : AndroidViewModel(app) {
         .map { list -> list.map { it.reminderId }.toSet() }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptySet())
 
+    private val ticker = flow {
+        while (true) {
+            emit(System.currentTimeMillis())
+            delay(60_000)
+        }
+    }
+
+    val missed = combine(
+        dao.observeReminders(),
+        dao.observeCompletionsFrom(LocalDate.now().toEpochDay() - 8),
+        ticker
+    ) { rs, cs, now -> computeMissed(rs, cs.map { it.reminderId to it.epochDay }.toSet(), now) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    fun markMissedDone(m: Missed) = viewModelScope.launch(Dispatchers.IO) {
+        dao.complete(Completion(m.r.id, m.day, System.currentTimeMillis()))
+        app.getSystemService(NotificationManager::class.java).cancel(m.r.id.toInt())
+    }
+
+    // إعادة التذكير لا تسجّل الإنجاز
+    fun reRemind(m: Missed, hour: Int, minute: Int) {
+        Scheduler.snoozeAt(app, m.r.id, Scheduler.nextClock(hour, minute), m.day)
+    }
+
     fun save(r: Reminder) = viewModelScope.launch(Dispatchers.IO) {
         val id = if (r.id == 0L) dao.insert(r) else { dao.update(r); r.id }
         Scheduler.schedule(app, r.copy(id = id))
     }
 
     fun delete(r: Reminder) = viewModelScope.launch(Dispatchers.IO) {
-        Scheduler.cancel(app, r.id)
+        Scheduler.cancelAll(app, r.id)
         dao.deleteCompletions(r.id)
         dao.delete(r.id)
     }
@@ -153,6 +180,8 @@ fun Root(vm: MainVm = viewModel()) {
     val ctx = LocalContext.current
     val reminders by vm.reminders.collectAsStateWithLifecycle()
     val done by vm.doneToday.collectAsStateWithLifecycle()
+    val missed by vm.missed.collectAsStateWithLifecycle()
+    var showMissed by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Reminder?>(null) }
     var creating by remember { mutableStateOf(false) }
     var canExact by remember { mutableStateOf(true) }
@@ -165,9 +194,18 @@ fun Root(vm: MainVm = viewModel()) {
         val am = ctx.getSystemService(AlarmManager::class.java)
         canExact = Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms()
     }
-    BackHandler(enabled = creating || editing != null) { creating = false; editing = null }
+    BackHandler(enabled = creating || editing != null || showMissed) {
+        creating = false; editing = null; showMissed = false
+    }
 
-    if (creating || editing != null) {
+    if (showMissed) {
+        MissedScreen(
+            missed = missed,
+            onDone = { vm.markMissedDone(it) },
+            onReRemind = { m, h, min -> vm.reRemind(m, h, min) },
+            onClose = { showMissed = false }
+        )
+    } else if (creating || editing != null) {
         EditScreen(
             initial = editing,
             onSave = { vm.save(it); creating = false; editing = null },
@@ -177,6 +215,7 @@ fun Root(vm: MainVm = viewModel()) {
     } else {
         Home(
             reminders = reminders, done = done, canExact = canExact,
+            missedCount = missed.size, onOpenMissed = { showMissed = true },
             onAdd = { creating = true },
             onEdit = { editing = it },
             onToggleDone = { r, d -> vm.setDone(r, d) },
@@ -190,6 +229,8 @@ fun Home(
     reminders: List<Reminder>,
     done: Set<Long>,
     canExact: Boolean,
+    missedCount: Int,
+    onOpenMissed: () -> Unit,
     onAdd: () -> Unit,
     onEdit: (Reminder) -> Unit,
     onToggleDone: (Reminder, Boolean) -> Unit,
@@ -197,7 +238,12 @@ fun Home(
 ) {
     val ctx = LocalContext.current
     Scaffold(
-        topBar = { TopAppBar(title = { Text("رفيقك في الذكر") }) },
+        topBar = {
+            TopAppBar(
+                title = { Text("رفيقك في الذكر") },
+                actions = { TextButton(onClick = onOpenMissed) { Text("الفوائت ($missedCount)") } }
+            )
+        },
         floatingActionButton = { ExtendedFloatingActionButton(onClick = onAdd) { Text("تذكير جديد") } }
     ) { pad ->
         LazyColumn(
@@ -336,7 +382,8 @@ fun EditScreen(initial: Reminder?, onSave: (Reminder) -> Unit, onDelete: () -> U
                             hour = hour, minute = minute, repeatType = repeat,
                             daysMask = if (needsDays) mask else 0,
                             onceEpochDay = onceDay, sound = sound,
-                            enabled = initial?.enabled ?: true
+                            enabled = initial?.enabled ?: true,
+                            createdAt = initial?.createdAt ?: System.currentTimeMillis()
                         )
                     )
                 },
@@ -380,6 +427,66 @@ fun EditScreen(initial: Reminder?, onSave: (Reminder) -> Unit, onDelete: () -> U
             text = { Text("سيُحذف التذكير مع سجل إنجازاته.") },
             confirmButton = { TextButton(onClick = { confirmDelete = false; onDelete() }) { Text("حذف") } },
             dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("إلغاء") } }
+        )
+    }
+}
+
+fun dayLabel(epochDay: Long): String {
+    val today = LocalDate.now().toEpochDay()
+    return when (epochDay) {
+        today -> "اليوم"
+        today - 1 -> "أمس"
+        else -> DAY_NAMES[LocalDate.ofEpochDay(epochDay).dayOfWeek.value % 7]
+    }
+}
+
+@Composable
+fun MissedScreen(
+    missed: List<Missed>,
+    onDone: (Missed) -> Unit,
+    onReRemind: (Missed, Int, Int) -> Unit,
+    onClose: () -> Unit
+) {
+    var target by remember { mutableStateOf<Missed?>(null) }
+    Scaffold(topBar = {
+        TopAppBar(
+            title = { Text("العبادات الفائتة") },
+            navigationIcon = { TextButton(onClick = onClose) { Text("رجوع") } }
+        )
+    }) { pad ->
+        LazyColumn(
+            Modifier.padding(pad).fillMaxSize(),
+            contentPadding = PaddingValues(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            if (missed.isEmpty()) item { Text("لا توجد عبادات فائتة.", Modifier.padding(16.dp)) }
+            items(missed, key = { "${it.r.id}-${it.day}" }) { m ->
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(m.r.title, style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "${m.r.category} · ${dayLabel(m.day)} · ${fmtTime(m.r.hour, m.r.minute)}",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { onDone(m) }) { Text("تم") }
+                            OutlinedButton(onClick = { target = m }) { Text("إعادة التذكير") }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    target?.let { m ->
+        val later = LocalTime.now().plusMinutes(30)
+        val st = rememberTimePickerState(initialHour = later.hour, initialMinute = later.minute, is24Hour = false)
+        AlertDialog(
+            onDismissRequest = { target = null },
+            confirmButton = {
+                TextButton(onClick = { onReRemind(m, st.hour, st.minute); target = null }) { Text("تذكيري") }
+            },
+            dismissButton = { TextButton(onClick = { target = null }) { Text("إلغاء") } },
+            text = { TimePicker(state = st) }
         )
     }
 }
